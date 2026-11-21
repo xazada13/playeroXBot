@@ -7,17 +7,22 @@
   - много объявлений: короткие названия, страницы, поиск, массовые действия, копирование настроек;
   - порядок в чате: одно сообщение-меню, автоудаление ваших сообщений и старых уведомлений,
     сообщения одного покупателя собираются в одно уведомление, кнопка «Очистить»;
-  - статистика за день.
+  - статистика за день;
+  - финансы: баланс, траты, прибыль с учётом комиссии, экспорт в CSV.
 Работает только для владельца (OWNER_ID).
 """
 import asyncio
+import copy
+import csv
 import html
+import io
 import inspect
 import json
 import logging
 import logging.handlers
 import os
 import re
+import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,7 +34,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from dotenv import load_dotenv
 from PlayerokAPI import Account, EventType, UnauthorizedError
@@ -61,6 +66,21 @@ DEFAULTS = {
     "notify": {"deal": True, "message": True, "silent_msgs": False, "msg_ttl_h": 24},
     "items": {},
     "stats": {},
+    # финансы: всё новое лежит в одном ключе, старые ключи не затрагиваются
+    "fin": {
+        "ver": 0,                 # версия схемы (для миграции)
+        "since": 0,               # когда начался точный учёт сделок
+        "period": "7d",           # последний выбранный период
+        "commission_pct": 10.0,   # процент комиссии, если Playerok не отдал её сам
+        "cats": ["Премиум Playerok", "Реклама", "Прочее"],
+        "expenses": [],           # траты: id, ts, amount, cat, comment, src, ext
+        "next_id": 1,
+        "ignored_tx": [],         # удалённые автотраты, чтобы они не вернулись при синхронизации
+        "deals": {},              # учтённые сделки: id сделки -> данные (каждая ровно один раз)
+        "legacy": {},             # старая дневная статистика, сохранённая при миграции
+        "sync": {"ts": 0, "ok": None, "method": "", "note": ""},
+        "methods": {},            # какие методы Playerok реально сработали
+    },
 }
 LABELS = {
     "paid": "💳 После оплаты",
@@ -90,7 +110,7 @@ def load_settings() -> dict:
             data = json.loads(SETTINGS_FILE.read_text("utf-8"))
         except Exception:
             log.exception("settings.json повреждён, беру значения по умолчанию")
-    return merge(DEFAULTS, data)
+    return merge(copy.deepcopy(DEFAULTS), data)
 
 
 def save_settings() -> None:
@@ -567,7 +587,16 @@ async def on_deal(deal, key: str) -> None:
             except Exception:
                 log.exception("Не удалось отправить отложенный ответ")
     if key == "paid":
+        try:
+            record_deal(deal)
+        except Exception:
+            log.exception("Финансы: не удалось записать сделку")
         bump_stats(deal)
+    elif key == "problem":
+        try:
+            mark_problem(deal)
+        except Exception:
+            log.exception("Финансы: не удалось пометить сделку")
 
     custom = find_item_rule(deal)
     auto = bool(key == "paid" and custom and custom.get("auto_confirm") and deal_id)
@@ -751,6 +780,530 @@ async def cleanup_loop() -> None:
                 await asyncio.sleep(0.1)
 
 
+# ------------------------------------------------------------------ финансы
+FIN_VER = 1
+DASH = "—"
+PERIOD_NAMES = {"today": "сегодня", "7d": "7 дней", "30d": "30 дней", "all": "всё время"}
+PERIOD_BTN = [("today", "Сегодня"), ("7d", "7 дн"), ("30d", "30 дн"), ("all", "Всё")]
+PREMIUM_CAT = "Премиум Playerok"
+LOGGED = set()   # что уже записали в лог один раз (чтобы не засорять его)
+
+
+def num(v):
+    """Число из чего угодно (число, строка, Decimal). None, если это не число."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, str):
+        v = v.replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x and abs(x) != float("inf") else None
+
+
+def enum_name(v) -> str:
+    return str(getattr(v, "name", v) or "").upper()
+
+
+def fmt_money(x, sign: bool = False) -> str:
+    """1234.5 -> «1 234,50 ₽». None -> прочерк."""
+    if x is None:
+        return DASH
+    x = round(x, 2)
+    body = f"{abs(x):,.2f}".replace(",", "\u00a0").replace(".", ",")
+    pre = "−" if x < 0 else ("+" if sign and x > 0 else "")
+    return f"{pre}{body}\u00a0₽"
+
+
+def parse_ts(v):
+    """Время из datetime, числа (секунды или миллисекунды) или ISO-строки -> секунды Unix."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return (v if v.tzinfo else v.replace(tzinfo=timezone.utc)).timestamp()
+    if isinstance(v, str):
+        try:
+            d = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+            return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
+        except ValueError:
+            pass
+    n = num(v)
+    if n:
+        return n / 1000 if n > 1e11 else n
+    return None
+
+
+def migrate_fin() -> None:
+    """Один раз переносит старую статистику в «Финансы». Старые ключи не трогаем,
+    перед первым сохранением делаем резервную копию settings.json."""
+    f = S["fin"]
+    if f.get("ver", 0) >= FIN_VER:
+        return
+    if SETTINGS_FILE.exists():
+        bak = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".bak-before-finance")
+        if not bak.exists():
+            try:
+                shutil.copy2(SETTINGS_FILE, bak)
+            except Exception:
+                log.exception("Не удалось сделать резервную копию settings.json")
+    legacy = {}
+    for day, v in (S.get("stats") or {}).items():
+        try:
+            legacy[str(day)] = {"orders": int(v.get("orders", 0) or 0), "sum": float(v.get("sum", 0) or 0)}
+        except Exception:
+            log.warning("Финансы: пропустил непонятную запись старой статистики %s", day)
+    f["legacy"] = legacy
+    f["since"] = time.time()
+    f["ver"] = FIN_VER
+    save_settings()
+    log.info("Финансы: миграция выполнена, старых дней статистики: %s", len(legacy))
+
+
+# ----- баланс
+BAL_FIELDS = {
+    "available": ("available",),
+    "frozen": ("frozen", "hold", "on_hold", "held"),
+    "pending": ("pending_income", "pendingIncome", "pending"),
+    "total": ("value", "total", "total_value"),
+}
+
+
+async def fetch_balance(me=None) -> dict:
+    """Баланс ровно так, как его отдаёт аккаунт Playerok. Ничего не вычисляется:
+    чего нет в ответе, то None (в интерфейсе будет прочерк, в логе предупреждение)."""
+    out = {k: None for k in BAL_FIELDS}
+    bal, src = None, ""
+    try:
+        if me is None:
+            me = await asyncio.wait_for(acc.get_me(), 20)
+        bal, src = g(me, "balance"), "get_me().balance"
+    except Exception:
+        log.exception("Баланс: не удалось получить данные аккаунта")
+    if bal is None:
+        try:
+            bal = await asyncio.wait_for(_try(acc, [("get_balance", (), {})]), 20)
+            src = "get_balance()"
+        except Exception as e:
+            log.warning("Баланс: get_balance недоступен: %s", e)
+        if bal is None and not callable(getattr(acc, "balance", None)):
+            bal, src = getattr(acc, "balance", None), "acc.balance"
+    if bal is None or isinstance(bal, (int, float, str)):
+        log.warning("Баланс: объект баланса не найден или это одно число без пояснений (%s)", describe(bal, 1))
+        return out
+    if "bal" not in LOGGED:
+        LOGGED.add("bal")
+        log.info("Баланс: поля объекта (%s): %s", src, describe(bal, 1))
+    for key, names in BAL_FIELDS.items():
+        out[key] = num(g(bal, *names))
+        if out[key] is None and (key != "pending"):
+            log.warning("Баланс: поле «%s» недоступно (искал: %s)", key, ", ".join(names))
+    if any(v is not None for v in out.values()) and S["fin"]["methods"].get("balance") != src:
+        S["fin"]["methods"]["balance"] = src
+        save_settings()
+    return out
+
+
+def balance_lines(b: dict) -> list:
+    lines = [f"✅ Доступно: <b>{fmt_money(b['available'])}</b>",
+             f"⏳ В холде: <b>{fmt_money(b['frozen'])}</b>"]
+    if b.get("pending") is not None:
+        lines.append(f"🕓 Ожидает зачисления: <b>{fmt_money(b['pending'])}</b>")
+    lines.append(f"💼 Всего: <b>{fmt_money(b['total'])}</b>")
+    return lines
+
+
+# ----- сделки: прибыль с учётом комиссии
+def record_deal(deal) -> bool:
+    """Записывает оплаченную сделку в учёт. Ключ — id сделки, поэтому повторное событие
+    (перезапуск, повторное обновление статуса) вторую запись не создаст."""
+    deal_id = g(deal, "id")
+    if not deal_id:
+        log.warning("Финансы: у сделки нет id, в прибыль не учтена")
+        return False
+    f = S["fin"]
+    key = str(deal_id)
+    if key in f["deals"]:
+        return False
+    tx, it = g(deal, "transaction"), g(deal, "item")
+    if tx is not None and "tx" not in LOGGED:
+        LOGGED.add("tx")
+        log.info("Финансы: поля транзакции сделки: %s", describe(tx, 2))
+    price = num(g(deal, "price", "amount"))
+    if price is None:
+        price = num(g(it, "price"))
+    if price is None:
+        price = num(g(tx, "value", "amount"))
+    if price is None:
+        log.warning("Финансы: у сделки %s не нашёл сумму, записана как 0", key)
+    gross = price or 0.0
+
+    fee_raw = g(tx, "fee", "commission", "commission_value", "service_fee")
+    if fee_raw is None:
+        fee_raw = g(deal, "fee", "commission")
+    fee = num(fee_raw)
+    if fee is None and fee_raw is not None:
+        fee = num(g(fee_raw, "value", "amount"))
+    if fee is not None:
+        fee = abs(fee)
+        if gross > 0 and fee > gross:  # похоже на процент или ошибку данных
+            log.warning("Финансы: комиссия %s больше суммы %s у сделки %s, считаю по проценту", fee, gross, key)
+            fee = None
+    known = fee is not None
+    if not known:
+        fee = round(gross * float(f.get("commission_pct", 0) or 0) / 100, 2)
+
+    rule = find_item_rule(deal)
+    title = alias_of(rule) if rule else (deal_item_name(deal) or "Без названия")
+    f["deals"][key] = {"ts": time.time(), "gross": round(gross, 2), "fee": round(fee, 2),
+                       "fee_known": known, "item_id": str(g(it, "id") or ""),
+                       "title": title[:60], "no_amount": price is None}
+    save_settings()
+    return True
+
+
+def mark_problem(deal) -> None:
+    d = S["fin"]["deals"].get(str(g(deal, "id")))
+    if d and not d.get("problem"):
+        d["problem"] = True
+        save_settings()
+
+
+# ----- периоды и итоги
+def period_start(p: str) -> float:
+    """Начало периода (по МСК). «7 дней» = сегодня и 6 предыдущих дней."""
+    days = {"today": 0, "7d": 6, "30d": 29}.get(p)
+    if days is None:
+        return 0.0
+    day0 = datetime.now(MSK).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (day0 - timedelta(days=days)).timestamp()
+
+
+def fin_totals(period: str) -> dict:
+    f = S["fin"]
+    start = period_start(period)
+    start_day = datetime.fromtimestamp(start, MSK).strftime("%Y-%m-%d") if start else ""
+    t = {"n": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "spent": 0.0, "fee_est": False,
+         "legacy_n": 0, "legacy_sum": 0.0, "problems": 0, "no_amount": 0, "items": {}, "cats": {}}
+    for d in f["deals"].values():
+        if d.get("ts", 0) < start:
+            continue
+        net = d["gross"] - d["fee"]
+        t["n"] += 1
+        t["gross"] += d["gross"]
+        t["fee"] += d["fee"]
+        t["net"] += net
+        t["fee_est"] |= not d.get("fee_known")
+        t["problems"] += 1 if d.get("problem") else 0
+        t["no_amount"] += 1 if d.get("no_amount") else 0
+        row = t["items"].setdefault(d.get("title") or "Без названия", [0.0, 0])
+        row[0] += net
+        row[1] += 1
+    for day, v in f["legacy"].items():
+        if day >= start_day:
+            t["legacy_n"] += v.get("orders", 0)
+            t["legacy_sum"] += v.get("sum", 0)
+    t["net"] += t["legacy_sum"]
+    for e in f["expenses"]:
+        if e["ts"] >= start:
+            t["spent"] += e["amount"]
+            t["cats"][e["cat"]] = t["cats"].get(e["cat"], 0.0) + e["amount"]
+    t["approx"] = t["fee_est"] or t["legacy_n"] > 0
+    t["profit"] = t["net"] - t["spent"]
+    for k in ("gross", "fee", "net", "spent", "profit", "legacy_sum"):
+        t[k] = round(t[k], 2)
+    return t
+
+
+# ----- траты
+def add_expense(amount: float, cat: str, comment: str = "", ts=None, src: str = "manual",
+                ext: str = "", save: bool = True) -> dict:
+    f = S["fin"]
+    e = {"id": f["next_id"], "ts": ts or time.time(), "amount": round(float(amount), 2),
+         "cat": (cat or "Прочее")[:30], "comment": (comment or "")[:100], "src": src, "ext": ext}
+    f["next_id"] += 1
+    f["expenses"].append(e)
+    if save:
+        save_settings()
+    return e
+
+
+def remove_expense(eid: int):
+    f = S["fin"]
+    for i, e in enumerate(f["expenses"]):
+        if e["id"] == eid:
+            f["expenses"].pop(i)
+            if e.get("ext"):  # автотрата: запоминаем, чтобы синхронизация её не вернула
+                f["ignored_tx"].append(e["ext"])
+                del f["ignored_tx"][:-500]
+            save_settings()
+            return e
+    return None
+
+
+def last_expense():
+    ex = S["fin"]["expenses"]
+    return max(ex, key=lambda e: e["id"]) if ex else None
+
+
+def parse_amount(text: str):
+    t = text.replace("\u00a0", "").replace(" ", "")
+    m = re.search(r"\d+(?:[.,]\d{1,2})?", t)
+    if not m:
+        return None
+    x = num(m.group(0))
+    return x if x and 0 < x < 1e9 else None
+
+
+def day_ts(offset: int) -> float:
+    if offset == 0:
+        return time.time()
+    d = datetime.now(MSK).replace(hour=12, minute=0, second=0, microsecond=0) - timedelta(days=offset)
+    return d.timestamp()
+
+
+def parse_date_text(text: str):
+    t = text.strip().lower()
+    if t in ("сегодня", "today"):
+        return day_ts(0)
+    if t in ("вчера", "yesterday"):
+        return day_ts(1)
+    m = re.match(r"^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$", t)
+    if not m:
+        return None
+    now = datetime.now(MSK)
+    dd, mm = int(m.group(1)), int(m.group(2))
+    yy = int(m.group(3)) if m.group(3) else now.year
+    if yy < 100:
+        yy += 2000
+    try:
+        d = datetime(yy, mm, dd, 12, tzinfo=MSK)
+    except ValueError:
+        return None
+    if not m.group(3) and d > now + timedelta(days=1):
+        d = d.replace(year=yy - 1)
+    if d.date() == now.date():
+        return time.time()
+    return d.timestamp() if d < now else None
+
+
+# ----- автоподтягивание трат из истории транзакций Playerok
+READ_WORDS = ("get", "list", "history", "fetch", "all")
+WRITE_WORDS = ("create", "withdraw", "delete", "remove", "cancel", "update", "send", "verify",
+               "confirm", "pay", "add", "set", "post", "request", "bind", "unbind")
+TX_NAMESPACES = ("transactions", "payments", "wallet", "finance", "finances", "balance", "profile")
+EXPENSE_WORDS = ("PREMIUM", "SUBSCRIPT", "PRIORITY", "BUMP", "PROMOT", "BOOST")
+FAIL_WORDS = ("FAIL", "CANCEL", "REJECT", "DECLIN", "EXPIRE", "ROLL", "DENIED", "ERROR")
+
+
+def as_list(res) -> list:
+    if res is None:
+        return []
+    if isinstance(res, (list, tuple)):
+        return [g(e, "node", default=e) for e in res]
+    for n in ("transactions", "items", "nodes", "data", "results", "list", "edges"):
+        v = g(res, n)
+        if isinstance(v, (list, tuple)):
+            return [g(e, "node", default=e) for e in v]
+    return []
+
+
+def flex_kwargs(fn, limit: int):
+    """Подбирает аргументы по именам параметров. None, если нужен аргумент, который нечем заполнить."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return {}
+    kw = {}
+    for p in params:
+        if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        n = p.name.lower()
+        if n in ("count", "limit", "first", "page_size", "size", "per_page"):
+            kw[p.name] = limit
+        elif n in ("user_id", "userid", "account_id", "me_id"):
+            kw[p.name] = ME_ID
+        elif p.default is inspect.Parameter.empty:
+            return None
+    return kw
+
+
+def tx_candidates() -> list:
+    """Методы библиотеки, которые по названию похожи на «получить список транзакций»."""
+    out, seen = [], set()
+    for ns_name in (None,) + TX_NAMESPACES:
+        ns = acc if ns_name is None else getattr(acc, ns_name, None)
+        if ns is None:
+            continue
+        for n in dir(ns):
+            low = n.lower()
+            fn = getattr(ns, n, None)
+            if n.startswith("_") or not callable(fn):
+                continue
+            if any(w in low for w in WRITE_WORDS):
+                continue
+            if ns_name is None:
+                ok = ("transaction" in low or "payment" in low or "operation" in low) \
+                    and any(w in low for w in READ_WORDS)
+                ok = ok or low in ("transactions", "payments")
+            else:
+                ok = any(w in low for w in READ_WORDS) or low in ("transactions", "payments")
+            label = f"{'acc' if ns_name is None else 'acc.' + ns_name}.{n}"
+            if ok and label not in seen:
+                seen.add(label)
+                out.append((0 if "transaction" in low else 1, label, fn))
+    out.sort(key=lambda x: (x[0], x[1]))
+    return [(label, fn) for _, label, fn in out]
+
+
+def looks_like_tx(x) -> bool:
+    return g(x, "value", "amount", "sum") is not None
+
+
+async def fetch_transactions(limit: int = 100):
+    """(список транзакций, имя сработавшего метода). Если подходящего метода нет, ([], '')."""
+    first_ok = ""
+    for label, fn in tx_candidates():
+        kw = flex_kwargs(fn, limit)
+        if kw is None:
+            continue
+        try:
+            res = fn(**kw)
+            if inspect.isawaitable(res):
+                res = await res
+            if hasattr(res, "__aiter__"):
+                res = [x async for x in res][:limit]
+        except Exception as e:
+            log.info("Транзакции: %s не подошёл: %s", label, str(e)[:150])
+            continue
+        items = [x for x in as_list(res) if looks_like_tx(x)]
+        if items:
+            return items, label
+        first_ok = first_ok or label
+    return [], first_ok
+
+
+def classify_tx(t):
+    """(вид, причина). Вид «expense» — платёж за премиум и подобное. Выводы денег, доходы
+    и неудавшиеся операции расходами не считаются."""
+    status = enum_name(g(t, "status", "state"))
+    direction = enum_name(g(t, "direction", "flow"))
+    op = " ".join(enum_name(g(t, n)) for n in ("operation", "type", "kind", "reason", "title", "description"))
+    if any(w in status for w in FAIL_WORDS):
+        return "skip", "неудачная операция"
+    if "WITHDRAW" in op or "PAYOUT" in op:
+        return "skip", "вывод средств"
+    val = num(g(t, "value", "amount", "sum"))
+    is_out = direction in ("OUT", "OUTCOME", "OUTGOING", "DEBIT", "EXPENSE", "SPEND") or (val is not None and val < 0)
+    if not is_out:
+        return "skip", "не расход"
+    if any(w in op for w in EXPENSE_WORDS):
+        return "expense", ""
+    return "skip", f"прочее: {op.strip()[:40] or 'без названия'}"
+
+
+def tx_ext(t) -> str:
+    tid = g(t, "id")
+    if tid:
+        return f"tx:{tid}"
+    return f"tx:h:{int(parse_ts(g(t, 'created_at', 'createdAt')) or 0)}:{num(g(t, 'value', 'amount'))}"
+
+
+SYNC_LOCK = asyncio.Lock()
+
+
+async def sync_expenses() -> dict:
+    """Подтягивает траты на премиум из истории транзакций. Возвращает {ok, added, method, note}."""
+    async with SYNC_LOCK:
+        f = S["fin"]
+        res = {"ok": False, "added": 0, "method": "", "note": ""}
+        try:
+            txs, method = await asyncio.wait_for(fetch_transactions(), 90)
+        except Exception as e:
+            log.exception("Траты: ошибка запроса истории транзакций")
+            txs, method = [], ""
+            res["note"] = f"ошибка запроса: {str(e)[:80]}"
+        if not method:
+            res["note"] = res["note"] or "библиотека не отдаёт историю транзакций, используйте ручной ввод"
+            log.warning("Траты: метод истории транзакций не найден. Команда /findiag покажет методы библиотеки")
+        else:
+            res["method"] = method
+            if txs and "txs" not in LOGGED:
+                LOGGED.add("txs")
+                log.info("Траты: пример транзакции из %s: %s", method, describe(txs[0], 2))
+            known = {e.get("ext") for e in f["expenses"] if e.get("ext")}
+            ignored = set(f["ignored_tx"])
+            skipped, added, similar = {}, 0, 0
+            for t in txs:
+                kind, why = classify_tx(t)
+                if kind != "expense":
+                    skipped[why] = skipped.get(why, 0) + 1
+                    continue
+                ext = tx_ext(t)
+                amount = num(g(t, "value", "amount", "sum"))
+                if ext in known or ext in ignored or not amount:
+                    continue
+                amount, ts = abs(amount), parse_ts(g(t, "created_at", "createdAt", "date", "completed_at",
+                                                      "completedAt", "verified_at")) or time.time()
+                if any(e.get("src") == "manual" and abs(e["amount"] - amount) < 0.005
+                       and abs(e["ts"] - ts) < 2 * 86400 for e in f["expenses"]):
+                    similar += 1  # уже внесено вручную, второй раз не добавляем
+                    continue
+                add_expense(amount, PREMIUM_CAT, "из истории Playerok", ts, src="api", ext=ext, save=False)
+                known.add(ext)
+                added += 1
+            res.update(ok=True, added=added)
+            res["note"] = (f"добавлено из истории: {added}" if added else "новых трат нет")
+            if similar:
+                res["note"] += f" (уже внесённых вручную пропущено: {similar})"
+            log.info("Траты: метод %s, получено %s, добавлено %s, пропущено по причинам: %s",
+                     method, len(txs), added, skipped)
+            f["methods"]["transactions"] = method
+        f["sync"] = {"ts": time.time(), "ok": res["ok"], "method": method, "note": res["note"]}
+        save_settings()
+        return res
+
+
+async def fin_sync_loop() -> None:
+    await asyncio.sleep(45)
+    while True:
+        try:
+            await sync_expenses()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Финансы: сбой автосинхронизации трат")
+        await asyncio.sleep(6 * 3600)
+
+
+# ----- экспорт
+def build_csv(period: str) -> bytes:
+    f = S["fin"]
+    start = period_start(period)
+    start_day = datetime.fromtimestamp(start, MSK).strftime("%Y-%m-%d") if start else ""
+    rows = []
+    for d in f["deals"].values():
+        if d["ts"] >= start:
+            rows.append((d["ts"], ["Сделка", d["title"], d["gross"], d["fee"],
+                                   "да" if d.get("fee_known") else "нет (оценка)", round(d["gross"] - d["fee"], 2), ""]))
+    for e in f["expenses"]:
+        if e["ts"] >= start:
+            rows.append((e["ts"], ["Трата", e["cat"], e["amount"], "", "", -e["amount"],
+                                   e["comment"] + (" [авто]" if e.get("src") == "api" else "")]))
+    rows.sort(key=lambda r: r[0])
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["Дата", "Тип", "Название / категория", "Сумма", "Комиссия", "Комиссия точная", "Итог", "Комментарий"])
+    for day, v in sorted(f["legacy"].items()):
+        if day >= start_day:
+            w.writerow([day, "Старая статистика", f"заказов: {v.get('orders', 0)}", "", "", "нет",
+                        f"{float(v.get('sum', 0)):.2f}".replace(".", ","), ""])
+    for ts, r in rows:
+        r = [f"{x:.2f}".replace(".", ",") if isinstance(x, float) else x for x in r]
+        w.writerow([datetime.fromtimestamp(ts, MSK).strftime("%Y-%m-%d %H:%M")] + r)
+    return buf.getvalue().encode("utf-8-sig")  # BOM, чтобы Excel сразу показал кириллицу
+
+
 # ---------------------------------------------------------------- Telegram
 dp = Dispatcher()
 PANEL = {"mid": None}   # id единственного сообщения-панели, которое редактируется на месте
@@ -786,7 +1339,7 @@ def main_kb() -> InlineKeyboardMarkup:
         [("🎯 Сценарии по объявлениям", "m:sc")],
         [("💬 Общие авто-ответы", "m:ar")],
         [("🔔 Уведомления", "m:notify"), (f"🧹 Очистить ({n})" if n else "🧹 Очистить", "m:clear")],
-        [("👤 Аккаунт", "m:acc")],
+        [("💰 Финансы", "m:fin"), ("👤 Аккаунт", "m:acc")],
     ])
 
 
@@ -839,6 +1392,11 @@ class Form(StatesGroup):
     alias = State()
     search = State()
     reply = State()
+    exp_amount = State()
+    exp_cat = State()
+    exp_comment = State()
+    exp_date = State()
+    pct = State()
 
 
 # ------------------------------------------------------------- общие экраны
@@ -1070,6 +1628,14 @@ async def cb_hide(q: CallbackQuery):
 async def cb_menu(q: CallbackQuery, state: FSMContext):
     await state.clear()
     key = q.data[2:]
+    if key == "fin":
+        await q.answer()  # сразу: запрос баланса может занять несколько секунд
+        try:
+            await show(q, *await fin_screen("bal"))
+        except Exception as e:
+            log.exception("Ошибка экрана «Финансы»")
+            await show(q, f"❗ Ошибка: {esc(str(e)[:300])}", kb([BACK]))
+        return
     try:
         if key == "main":
             await show(q, main_text(), main_kb())
@@ -1086,8 +1652,9 @@ async def cb_menu(q: CallbackQuery, state: FSMContext):
             return
         elif key == "acc":
             me = await acc.get_me()
-            await show(q, f"<b>👤 Аккаунт</b>\nПользователь: {esc(me.username)}\n"
-                          f"Баланс: {esc(me.balance.available)} ₽", kb([BACK]))
+            b = await fetch_balance(me)
+            await show(q, f"<b>👤 Аккаунт</b>\nПользователь: {esc(me.username)}\n\n"
+                          + "\n".join(balance_lines(b)), kb([BACK]))
     except Exception as e:
         log.exception("Ошибка меню")
         await show(q, f"❗ Ошибка: {esc(str(e)[:300])}", kb([BACK]))
@@ -1427,6 +1994,357 @@ async def cb_sc_site_action(q: CallbackQuery):
         await q.answer()
 
 
+# ----- финансы: экраны
+def fin_summary_text(period: str) -> str:
+    t = fin_totals(period)
+    ap = "≈ " if t["approx"] else ""
+    text = (f"<b>Итого · {PERIOD_NAMES[period]}</b>\n"
+            f"💵 Заработал: <b>{ap}{fmt_money(t['net'])}</b>\n"
+            f"💸 Потратил: <b>{fmt_money(t['spent'])}</b>\n"
+            f"📊 Чистая прибыль: <b>{ap}{fmt_money(t['profit'], True)}</b>")
+    if t["approx"]:
+        text += "\n<i>≈ комиссия оценена по проценту или взята из старой статистики</i>"
+    return text
+
+
+def fin_expense_line(e: dict) -> str:
+    when = datetime.fromtimestamp(e["ts"], MSK).strftime("%d.%m")
+    tail = f" · {esc(e['comment'][:25])}" if e.get("comment") else ""
+    return f"{when} · {esc(e['cat'])} · <b>{fmt_money(e['amount'])}</b>{tail}{' 🤖' if e.get('src') == 'api' else ''}"
+
+
+def fin_kb(tab: str, period: str, exps: list) -> InlineKeyboardMarkup:
+    names = [("bal", "Баланс"), ("exp", "Траты"), ("prof", "Прибыль")]
+    rows = [[(("• " if k == tab else "") + n, f"f:v:{k}:{period}") for k, n in names],
+            [(("✓ " if k == period else "") + n, f"f:v:{tab}:{k}") for k, n in PERIOD_BTN]]
+    if tab == "bal":
+        rows.append([("🔄 Обновить", f"f:v:bal:{period}")])
+    elif tab == "exp":
+        rows.append([("➕ Добавить", "f:xa"), ("🔁 Повторить последнюю", "f:xr")])
+        rows.append([("↩️ Отменить последнюю", "f:xu"), ("🔄 Из истории", "f:sync")])
+        if exps:
+            rows.append([(f"🗑 {i}", f"f:xdel:{e['id']}") for i, e in enumerate(exps, 1)])
+    else:
+        rows.append([(f"⚙️ Комиссия по умолчанию: {S['fin']['commission_pct']:g}%", "f:pct")])
+    rows.append([("📤 Экспорт CSV", f"f:exp:{period}")])
+    rows.append(BACK)
+    return kb(rows)
+
+
+async def fin_screen(tab: str = "bal", period: str = None, note: str = ""):
+    f = S["fin"]
+    if period not in PERIOD_NAMES:
+        period = f.get("period", "7d")
+        period = period if period in PERIOD_NAMES else "7d"
+    head = "💰 <b>Финансы</b>" + (f"\n{note}" if note else "")
+    exps = []
+    if tab == "bal":
+        b = await fetch_balance()
+        body = ("<b>💳 Баланс на Playerok</b>\n" + "\n".join(balance_lines(b))
+                + f"\n\n<i>Данные берутся прямо с аккаунта Playerok, ничего не пересчитывается. "
+                  f"«{DASH}» значит, что поле недоступно (причина в bot.log).</i>")
+    elif tab == "exp":
+        t = fin_totals(period)
+        lines = ["<b>💸 Траты</b>"]
+        if t["cats"]:
+            for c, v in sorted(t["cats"].items(), key=lambda x: -x[1])[:5]:
+                lines.append(f"▫️ {esc(c)}: {fmt_money(v)}")
+        else:
+            lines.append("За выбранный период трат нет.")
+        exps = sorted(f["expenses"], key=lambda e: (e["ts"], e["id"]), reverse=True)[:5]
+        lines.append("\n<b>Последние траты</b>")
+        if exps:
+            lines += [f"{i}. {fin_expense_line(e)}" for i, e in enumerate(exps, 1)]
+        else:
+            lines.append("Пока пусто. Нажмите «➕ Добавить».")
+        sy = f.get("sync") or {}
+        if sy.get("ts"):
+            when = datetime.fromtimestamp(sy["ts"], MSK).strftime("%d.%m %H:%M")
+            lines.append(f"\n🔄 История Playerok ({when}): {esc(sy.get('note') or DASH)}")
+        lines.append("<i>🤖 — добавлено автоматически. «🔁» копирует последнюю трату с сегодняшней датой.</i>")
+        body = "\n".join(lines)
+    else:
+        t = fin_totals(period)
+        est = "≈ " if t["fee_est"] else ""
+        lines = ["<b>📈 Прибыль</b>",
+                 f"Сделок: {t['n']}",
+                 f"Сумма сделок: {fmt_money(t['gross'])}",
+                 f"Комиссия Playerok: {est}{fmt_money(t['fee'])}",
+                 f"Заработано по сделкам: {est}{fmt_money(t['net'] - t['legacy_sum'])}"]
+        if t["legacy_n"]:
+            lines.append(f"Из старой статистики: ≈ {fmt_money(t['legacy_sum'])} ({t['legacy_n']} зак.)")
+        if t["problems"]:
+            lines.append(f"⚠️ Сделок с проблемой или возвратом: {t['problems']} (из суммы не вычитаются)")
+        if t["no_amount"]:
+            lines.append(f"⚠️ Сделок без суммы в данных: {t['no_amount']}")
+        lines.append("\n<b>По периодам</b>")
+        for k, label in PERIOD_BTN:
+            tp = fin_totals(k)
+            lines.append(f"{'▶️' if k == period else '▫️'} {PERIOD_NAMES[k].capitalize()}: "
+                         f"{'≈ ' if tp['approx'] else ''}{fmt_money(tp['net'])} · {tp['n'] + tp['legacy_n']} зак.")
+        lines.append(f"\n<b>Топ объявлений · {PERIOD_NAMES[period]}</b>")
+        top = sorted(t["items"].items(), key=lambda x: -x[1][0])[:5]
+        if top:
+            lines += [f"{i}. {esc(name)} — {fmt_money(v[0])} ({v[1]} шт.)" for i, (name, v) in enumerate(top, 1)]
+        else:
+            lines.append("Данных пока нет.")
+        lines.append(f"\n<i>Комиссия берётся из данных сделки. Если её там нет, считается {f['commission_pct']:g}% и сумма помечается «≈».</i>")
+        body = "\n".join(lines)
+    text = f"{head}\n\n{fin_summary_text(period)}\n\n{body}"
+    return text, fin_kb(tab, period, exps)
+
+
+def exp_cancel_kb():
+    return kb([[("‹ Отмена", "f:v:exp")]])
+
+
+def exp_cat_screen(amount: float):
+    cats = S["fin"]["cats"]
+    btns = [(c[:20], f"fl:c:{i}") for i, c in enumerate(cats)]
+    rows = [btns[j:j + 2] for j in range(0, len(btns), 2)] + [[("‹ Отмена", "f:v:exp")]]
+    return (f"➕ <b>Новая трата · шаг 2/4</b>\nСумма: <b>{fmt_money(amount)}</b>\n\n"
+            "Выберите категорию кнопкой или пришлите свою названием.", kb(rows))
+
+
+def exp_comment_screen(data: dict):
+    return (f"➕ <b>Новая трата · шаг 3/4</b>\n{fmt_money(data.get('amount'))} · {esc(data.get('cat', ''))}\n\n"
+            "Пришлите комментарий или нажмите «Без комментария».",
+            kb([[("Без комментария", "fl:s")], [("‹ Отмена", "f:v:exp")]]))
+
+
+def exp_date_screen():
+    return ("➕ <b>Новая трата · шаг 4/4</b>\n\nКогда это было? Выберите кнопкой или пришлите дату "
+            "в виде <code>15.11</code> или <code>15.11.2026</code>.",
+            kb([[("Сегодня", "fl:d:0"), ("Вчера", "fl:d:1")], [("‹ Отмена", "f:v:exp")]]))
+
+
+# ----- финансы: кнопки и ввод
+@dp.callback_query(F.data.startswith("f:v:"), owner_only)
+async def cb_fin_view(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = q.data.split(":")
+    tab = parts[2] if parts[2] in ("bal", "exp", "prof") else "bal"
+    period = parts[3] if len(parts) > 3 else None
+    if period in PERIOD_NAMES and S["fin"].get("period") != period:
+        S["fin"]["period"] = period
+        save_settings()
+    try:
+        await q.answer()  # сразу: запрос баланса может занять несколько секунд
+    except Exception:
+        pass
+    try:
+        await show(q, *await fin_screen(tab, period))
+    except Exception as e:
+        log.exception("Ошибка экрана «Финансы»")
+        await show(q, f"❗ Ошибка: {esc(str(e)[:300])}", kb([BACK]))
+
+
+@dp.callback_query(F.data == "f:xa", owner_only)
+async def cb_fin_add(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(Form.exp_amount)
+    await show(q, "➕ <b>Новая трата · шаг 1/4</b>\n\nПришлите сумму, например <code>499</code> или <code>1250,50</code>.",
+               exp_cancel_kb())
+    await q.answer()
+
+
+@dp.message(Form.exp_amount, F.text, ~F.text.startswith("/"), owner_only)
+async def got_exp_amount(m: Message, state: FSMContext):
+    await del_msg(m)
+    amount = parse_amount(m.text)
+    if amount is None:
+        await panel_edit("➕ <b>Новая трата · шаг 1/4</b>\n\n⚠️ Не понял сумму. Пришлите число, "
+                         "например <code>499</code> или <code>1250,50</code>.", exp_cancel_kb())
+        return
+    await state.update_data(amount=amount)
+    await state.set_state(Form.exp_cat)
+    await panel_edit(*exp_cat_screen(amount))
+
+
+async def exp_to_comment(state: FSMContext, cat: str):
+    cats = S["fin"]["cats"]
+    if cat not in cats:
+        cats.append(cat)
+        del cats[12:]
+        save_settings()
+    await state.update_data(cat=cat)
+    await state.set_state(Form.exp_comment)
+    return exp_comment_screen(await state.get_data())
+
+
+@dp.callback_query(F.data.startswith("fl:c:"), owner_only)
+async def cb_fl_cat(q: CallbackQuery, state: FSMContext):
+    cats = S["fin"]["cats"]
+    i = int(q.data.split(":")[2])
+    if await state.get_state() != Form.exp_cat.state or i >= len(cats):
+        await q.answer("Шаг устарел, начните заново", show_alert=True)
+        return
+    await show(q, *await exp_to_comment(state, cats[i]))
+    await q.answer()
+
+
+@dp.message(Form.exp_cat, F.text, ~F.text.startswith("/"), owner_only)
+async def got_exp_cat(m: Message, state: FSMContext):
+    await del_msg(m)
+    cat = m.text.strip()[:30]
+    if cat:
+        await panel_edit(*await exp_to_comment(state, cat))
+
+
+@dp.callback_query(F.data == "fl:s", owner_only)
+async def cb_fl_skip(q: CallbackQuery, state: FSMContext):
+    if await state.get_state() != Form.exp_comment.state:
+        await q.answer("Шаг устарел, начните заново", show_alert=True)
+        return
+    await state.update_data(comment="")
+    await state.set_state(Form.exp_date)
+    await show(q, *exp_date_screen())
+    await q.answer()
+
+
+@dp.message(Form.exp_comment, F.text, ~F.text.startswith("/"), owner_only)
+async def got_exp_comment(m: Message, state: FSMContext):
+    await del_msg(m)
+    await state.update_data(comment=m.text.strip()[:100])
+    await state.set_state(Form.exp_date)
+    await panel_edit(*exp_date_screen())
+
+
+async def finish_expense(state: FSMContext, ts: float) -> str:
+    d = await state.get_data()
+    await state.clear()
+    e = add_expense(d["amount"], d.get("cat", "Прочее"), d.get("comment", ""), ts)
+    return f"✅ Добавлено: {fin_expense_line(e)}"
+
+
+@dp.callback_query(F.data.startswith("fl:d:"), owner_only)
+async def cb_fl_date(q: CallbackQuery, state: FSMContext):
+    if await state.get_state() != Form.exp_date.state:
+        await q.answer("Шаг устарел, начните заново", show_alert=True)
+        return
+    note = await finish_expense(state, day_ts(int(q.data.split(":")[2])))
+    await show(q, *await fin_screen("exp", note=note))
+    await q.answer()
+
+
+@dp.message(Form.exp_date, F.text, ~F.text.startswith("/"), owner_only)
+async def got_exp_date(m: Message, state: FSMContext):
+    await del_msg(m)
+    ts = parse_date_text(m.text)
+    if ts is None:
+        await panel_edit("➕ <b>Новая трата · шаг 4/4</b>\n\n⚠️ Не понял дату. Пример: <code>15.11</code> "
+                         "(дата не должна быть в будущем).", exp_date_screen()[1])
+        return
+    note = await finish_expense(state, ts)
+    await panel_edit(*await fin_screen("exp", note=note))
+
+
+@dp.callback_query(F.data == "f:xr", owner_only)
+async def cb_fin_repeat(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    last = last_expense()
+    if not last:
+        await q.answer("Пока нечего повторять", show_alert=True)
+        return
+    e = add_expense(last["amount"], last["cat"], last.get("comment", ""))
+    await show(q, *await fin_screen("exp", note=f"🔁 Повторено: {fin_expense_line(e)}"))
+    await q.answer()
+
+
+@dp.callback_query(F.data == "f:xu", owner_only)
+async def cb_fin_undo(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    last = last_expense()
+    if not last:
+        await q.answer("Трат нет", show_alert=True)
+        return
+    remove_expense(last["id"])
+    await show(q, *await fin_screen("exp", note=f"↩️ Отменено: {fin_expense_line(last)}"))
+    await q.answer()
+
+
+@dp.callback_query(F.data.startswith("f:xdel:"), owner_only)
+async def cb_fin_del(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    e = remove_expense(int(q.data.split(":")[2]))
+    note = f"🗑 Удалено: {fin_expense_line(e)}" if e else "Эта трата уже удалена"
+    await show(q, *await fin_screen("exp", note=note))
+    await q.answer()
+
+
+@dp.callback_query(F.data == "f:sync", owner_only)
+async def cb_fin_sync(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await q.answer("Запрашиваю историю…")
+    try:
+        res = await sync_expenses()
+        note = ("🔄 " if res["ok"] else "⚠️ ") + esc(res["note"])
+    except Exception as e:
+        log.exception("Синхронизация трат")
+        note = f"⚠️ Не получилось: {esc(str(e)[:200])}"
+    await show(q, *await fin_screen("exp", note=note))
+
+
+@dp.callback_query(F.data == "f:pct", owner_only)
+async def cb_fin_pct(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(Form.pct)
+    await show(q, f"⚙️ <b>Комиссия по умолчанию</b>\nСейчас: {S['fin']['commission_pct']:g}%\n\n"
+                  "Пришлите процент числом, например <code>10</code> или <code>7,5</code>. Он применяется только "
+                  "к новым сделкам, у которых Playerok не отдал комиссию. Уже учтённые сделки не меняются.",
+               kb([[("‹ Отмена", "f:v:prof")]]))
+    await q.answer()
+
+
+@dp.message(Form.pct, F.text, ~F.text.startswith("/"), owner_only)
+async def got_pct(m: Message, state: FSMContext):
+    await del_msg(m)
+    v = num(m.text.replace("%", ""))
+    if v is None or not 0 <= v < 100:
+        await panel_edit("⚙️ <b>Комиссия по умолчанию</b>\n\n⚠️ Нужно число от 0 до 99, например <code>10</code>.",
+                         kb([[("‹ Отмена", "f:v:prof")]]))
+        return
+    await state.clear()
+    S["fin"]["commission_pct"] = round(v, 2)
+    save_settings()
+    await panel_edit(*await fin_screen("prof", note=f"✅ Комиссия по умолчанию: {v:g}%"))
+
+
+@dp.callback_query(F.data.startswith("f:exp:"), owner_only)
+async def cb_fin_export(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    period = q.data.split(":")[2]
+    if period not in PERIOD_NAMES:
+        period = "7d"
+    await q.answer("Готовлю файл…")
+    try:
+        data = build_csv(period)
+        await bot.send_document(
+            OWNER_ID, BufferedInputFile(data, filename=f"finance_{period}_{today_key()}.csv"),
+            caption=f"📤 Финансы · {PERIOD_NAMES[period]}: сделки и траты. Открывается в Excel.",
+            reply_markup=kb([[("🗑 Скрыть", "x:hide")]]))
+    except Exception as e:
+        log.exception("Экспорт финансов")
+        await panel_edit(f"❗ Не получилось отправить файл: {esc(str(e)[:200])}", kb([BACK]))
+
+
+@dp.message(Command("findiag"), owner_only)
+async def cmd_findiag(m: Message):
+    """Что финансовый блок реально нашёл в библиотеке Playerok."""
+    await del_msg(m)
+    f = S["fin"]
+    out = [f"Методы, которые сработали: {json.dumps(f['methods'], ensure_ascii=False) or '-'}",
+           f"Последняя синхронизация: {json.dumps(f['sync'], ensure_ascii=False)}",
+           "", "Кандидаты на историю транзакций:"]
+    out += [label for label, _ in tx_candidates()] or ["(не найдено)"]
+    out += ["", "Методы acc (по смыслу близкие к деньгам):"]
+    out += [x for x in ns_methods(acc) if any(w in x.lower() for w in
+                                              ("balance", "transaction", "payment", "wallet", "history", "operation", "me"))] or ["-"]
+    text = "\n".join(out)
+    for i in range(0, len(text), 3500):
+        await bot.send_message(OWNER_ID, f"<pre>{esc(text[i:i + 3500])}</pre>", reply_markup=kb([[("🗑 Скрыть", "x:hide")]]))
+
+
 # любое другое сообщение владельца удаляем, чтобы в чате не копился мусор
 @dp.message(owner_only)
 async def cleanup_any(m: Message):
@@ -1441,6 +2359,7 @@ async def main() -> None:
     if not PL_TOKEN:
         raise SystemExit("Нет токена Playerok. Задайте PLAYEROK_TOKEN в .env (или запустите login.py)")
 
+    migrate_fin()
     bot = Bot(TG_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp.message.filter(F.chat.type == "private")
     async with Account(token=PL_TOKEN) as a:
@@ -1455,7 +2374,8 @@ async def main() -> None:
             await send_panel(f"✅ Бот запущен · <b>{esc(me.username)}</b>\n\n{main_text()}")
         else:
             log.warning("OWNER_ID не задан: напишите боту /id и впишите число в .env")
-        tasks = [asyncio.create_task(events_loop()), asyncio.create_task(cleanup_loop())]
+        tasks = [asyncio.create_task(events_loop()), asyncio.create_task(cleanup_loop()),
+                 asyncio.create_task(fin_sync_loop())]
         try:
             await dp.start_polling(bot)
         finally:
